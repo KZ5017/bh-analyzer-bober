@@ -14,7 +14,13 @@ Special thanks for the Bober Edition version.
 
 ## Install
 
-Install the wheel with `pipx`:
+### Linux
+
+```bash
+pipx install "$(ls -t dist/blood_bober-*.whl | head -n 1)"
+```
+
+### Windows / PowerShell
 
 ```powershell
 pipx install (Get-ChildItem dist/blood_bober-*.whl | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
@@ -48,8 +54,18 @@ Then load a BloodHound ZIP file in the web UI and mark owned principals in the s
 
 ## Build
 
-On Windows/PowerShell, use the helper script. It keeps Python temporary files
-inside the project directory and builds without an isolated temp environment:
+### Linux
+
+Generic wheel build:
+
+```bash
+python -m build --wheel
+```
+
+### Windows / PowerShell
+
+Use the helper script. It keeps Python temporary files inside the project
+directory and builds without an isolated temp environment:
 
 ```powershell
 .\scripts\build-wheel.ps1
@@ -59,13 +75,6 @@ If the build tooling is missing from the virtual environment:
 
 ```powershell
 .\scripts\build-wheel.ps1 -InstallDeps
-```
-
-Generic build command, if your environment already handles Python temp
-directories cleanly:
-
-```bash
-python -m build --wheel
 ```
 
 The project also includes a prebuilt wheel under `dist/` for direct `pipx` installation.
